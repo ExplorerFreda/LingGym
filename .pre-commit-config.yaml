@@ -1,3 +1,4 @@
+default_install_hook_types: [pre-commit, commit-msg]
 # Scope every hook to source under src/ only. Everything else in the repo
 # (linguistic datasets, the jsonl/parquet exports, the HuggingFace cache, the
 # lockfile, top-level config) is left untouched.
