@@ -1,0 +1,58 @@
+# Scope every hook to source under src/ only. Everything else in the repo
+# (linguistic datasets, the jsonl/parquet exports, the HuggingFace cache, the
+# lockfile, top-level config) is left untouched.
+files: ^src/
+repos:
+  - repo: https://github.com/commitizen-tools/commitizen
+    rev: v4.13.10
+    hooks:
+      - id: commitizen
+        stages: [commit-msg]
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-added-large-files
+      - id: check-ast
+      - id: fix-byte-order-marker
+      - id: check-case-conflict
+      - id: check-json
+      - id: check-merge-conflict
+        args: [ --assume-in-merge ]
+      - id: check-symlinks
+      - id: check-yaml
+        args: [ "--unsafe" ]
+      - id: destroyed-symlinks
+      - id: detect-private-key
+      - id: end-of-file-fixer
+      - id: requirements-txt-fixer
+      - id: trailing-whitespace
+        args: [ --markdown-linebreak-ext=md ]
+      - id: mixed-line-ending
+        args: [ --fix=lf ]
+
+  - repo: https://github.com/codespell-project/codespell
+    rev: v2.4.1
+    hooks:
+      - id: codespell
+        args: [ --check-filenames, --check-hidden ]
+  - repo: https://github.com/jackdewinter/pymarkdown
+    rev: v0.9.35
+    hooks:
+      - id: pymarkdown
+        args: [ fix, -r ]
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.12
+    hooks:
+      # Lint must run before format: --fix can output code that needs reformatting.
+      - id: ruff-check
+        types_or: [ python, pyi, jupyter, pyproject ]
+        args: [ --fix ]
+      - id: ruff-format
+        types_or: [ python, pyi, jupyter, pyproject ]
+  # Fills the gap in ruff's DOC* family: ruff doesn't yet implement
+  # DOC101-DOC105 (argument coverage / order / type-mismatch).
+  - repo: https://github.com/jsh9/pydoclint
+    rev: 0.8.3
+    hooks:
+      - id: pydoclint
+        types_or: [ python, pyi ]

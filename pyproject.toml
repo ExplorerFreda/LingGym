@@ -1,0 +1,91 @@
+[project]
+name = "ling-gym"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "datasets>=5.0.0",
+    "ipython>=9.14.1",
+    "pre-commit>=4.6.0",
+]
+
+[tool.pymarkdown]
+plugins.md013.enabled = false # line-length
+plugins.md024.allow_different_nesting = true # no-duplicate-headers
+plugins.md025.enabled = false # single-header
+plugins.md028.enabled = false # no-blanks-blockquote
+plugins.md029.allow_extended_start_values = true # ol-prefix
+plugins.md034.enabled = false # no-bare-urls
+
+[tool.ruff]
+line-length = 100
+indent-width = 4
+target-version = "py314"
+
+[tool.ruff.format]
+quote-style = "single"
+indent-style = "space"
+docstring-code-format = true
+
+[tool.ruff.lint]
+preview = true
+explicit-preview-rules = true
+extend-select = [
+    # bugbear, comprehension, docstyle, pycodestyle, pyflakes
+    "B", "C419", "D", "E", "F", "W",
+    # refurb, isort, typecheck, useless-if-else
+    "FURB", "I", "TC", "RUF034",
+    # flake8-bandit, simplify, pyupgrade, invalid-escape-sequence
+    "S", "SIM", "S307", "UP", "W605",
+    # flake8-quotes, flake8-annotations, pydoclint
+    "Q", "ANN", "DOC",
+]
+fixable = [
+     # bugbear, pydocstyle, pycodestyle, unused-import
+    "B", "D", "E", "F401",
+    # refurb, unsorted-imports, ruff-specific
+    "FURB", "I001", "RUF",
+    # simplify, type-checking, pyupgrade, invalid-escape
+    "SIM", "TC", "UP", "W605",
+]
+ignore = [
+    "D10", "D200", "D202", "D203", "D205",
+    "D213", "D415", "D417",
+    "E11", "E402", "E501", "E701",
+    "E731", "E741",
+    "SIM105", "SIM401", "SIM118", # flake8-simplify
+    "S311", "S701",  "S101" # bandits, assert-used
+]
+
+[tool.ruff.lint.extend-per-file-ignores]
+"__init__.py" = [
+    "F401",   # unused-import
+    "F402",   # import-shadowed-by-loop-var
+    "F403",   # undefined-local-with-import-star
+    "F405",   # undefined-local-with-import-star-usage
+]
+"tests/**/*.py" = ["D100", "D102", "D103", "D104", "ANN"]
+
+[tool.ruff.lint.isort]
+combine-as-imports = true
+known-first-party = ["ling_gym"]
+lines-after-imports = 2
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+ignore-var-parameters = true
+
+[tool.ruff.lint.flake8-quotes]
+inline-quotes = "single"
+docstring-quotes = "double"
+
+[tool.pydoclint]
+style = "google"
+# Do not duplicate types inside docstrings; keep them in signatures.
+arg-type-hints-in-docstring = false
+arg-type-hints-in-signature = true
+check-return-types = false
+check-yield-types = false
+# Only comprehensive docstrings allowed.
+skip-checking-short-docstrings = false
