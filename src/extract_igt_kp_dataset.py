@@ -19,7 +19,7 @@ import logging
 import os
 import re
 import sys
-from collections import Counter
+from collections import Counter, defaultdict
 from typing import TYPE_CHECKING
 
 from datasets import Dataset, Features, Value
@@ -70,6 +70,7 @@ FEATURES = Features(
         'source_file': Value('string'),
         'chapter': Value('string'),
         'section': Value('string'),
+        'group_id': Value('string'),
     }
 )
 
@@ -95,6 +96,20 @@ _WHITESPACE_RE = re.compile(r'\s+')
 _TEXTSTYLE_RE = re.compile(r'\\textstyle[A-Za-z]*\{((?:[^{}]|\{[^{}]*\})*)\}')
 # Heading provenance: drop \label{...} (and dangling, unclosed fragments).
 _LABEL_RE = re.compile(r'\\label\{[^}]*\}?')
+
+# Example-grouping anchors. A KP range is two adjacent \ref/\cref/\autoref
+# anchors joined by one or more hyphen/en-dash/em-dash characters (an optional
+# empty "{}" may sit between the first anchor and the dash).
+_REF_RANGE_RE = re.compile(
+    r'\\(?:c?ref|autoref)\{([^}]+)\}\s*(?:\{\s*\})?\s*[-–—]+\s*'
+    r'\\(?:c?ref|autoref)\{([^}]+)\}',
+    re.IGNORECASE,
+)
+# Split a label into (scope, trailing integer): "ex:1:x656" -> ("ex:1:x", 656).
+_TRAILING_INT_RE = re.compile(r'(.*?)(\d+)$')
+# Only "ex:"/"exe:" labels carry sequential example indices worth expanding;
+# bookmark ids ("bkm:Ref...") and section/figure refs must not split a row.
+_EXAMPLE_LABEL_PREFIX_RE = re.compile(r'exe?:', re.IGNORECASE)
 
 
 def unwrap_command(text: str, cmd: str) -> str:
@@ -252,6 +267,84 @@ def parse_content(content: str | None) -> dict[str, str] | None:
     }
 
 
+def _split_trailing_int(label: str) -> tuple[str, int | None]:
+    """Split a label into its scope and trailing integer.
+
+    Args:
+        label: An example label, e.g. ``ex:1:x656`` or ``exe:main``.
+
+    Returns:
+        A ``(scope, number)`` pair where ``scope`` is the substring before the
+        trailing run of digits and ``number`` is that run as an ``int``
+        (``ex:1:x656`` -> ``('ex:1:x', 656)``), or ``(label, None)`` when the
+        label does not end in a digit.
+    """
+    match = _TRAILING_INT_RE.match(label)
+    if match:
+        return match.group(1), int(match.group(2))
+    return label, None
+
+
+def _sequential_ranges(kp_text: str) -> list[tuple[str, int, int]]:
+    r"""Extract the expandable example ranges referenced by a knowledge point.
+
+    A range counts as expandable only when both ``\\ref`` endpoints are
+    example-style labels (``ex:``/``exe:``) sharing one scope with ascending
+    trailing integers; bookmark-id or descending ranges are ignored so they do
+    not split a row.
+
+    Args:
+        kp_text: The raw ``Knowledge Point`` cell text.
+
+    Returns:
+        A ``(scope, lo, hi)`` tuple per expandable range, in order of
+        appearance.
+    """
+    ranges: list[tuple[str, int, int]] = []
+    for start, end in _REF_RANGE_RE.findall(kp_text):
+        if not (_EXAMPLE_LABEL_PREFIX_RE.match(start) and _EXAMPLE_LABEL_PREFIX_RE.match(end)):
+            continue
+        start_scope, start_num = _split_trailing_int(start)
+        end_scope, end_num = _split_trailing_int(end)
+        if start_num is None or end_num is None:
+            continue
+        if start_scope != end_scope or start_num > end_num:
+            continue
+        ranges.append((start_scope, start_num, end_num))
+    return ranges
+
+
+def _partition_row(labels: list[str], kp_text: str) -> list[int]:
+    r"""Assign each example label in a row to a local group key.
+
+    Every label defaults to group ``0`` (the row's catch-all group). Each
+    expandable range from ``kp_text`` claims the labels whose scope and trailing
+    integer fall inside it, minting a fresh group key (``1``, ``2`` ...) the
+    first time it claims a label; a label matched by several ranges joins the
+    first.
+
+    Args:
+        labels: The parseable example labels of one row, in column order.
+        kp_text: The raw ``Knowledge Point`` cell text for that row.
+
+    Returns:
+        A list of local group keys parallel to ``labels``.
+    """
+    ranges = _sequential_ranges(kp_text)
+    range_keys: dict[tuple[str, int, int], int] = {}
+    keys: list[int] = []
+    for label in labels:
+        scope, num = _split_trailing_int(label)
+        key = 0
+        if num is not None:
+            for rng in ranges:
+                if scope == rng[0] and rng[1] <= num <= rng[2]:
+                    key = range_keys.setdefault(rng, len(range_keys) + 1)
+                    break
+        keys.append(key)
+    return keys
+
+
 def discover_csv_files(csv_root: str, only_language: str | None = None) -> list[tuple[str, str]]:
     """Return ``(language, filepath)`` pairs for every grammar CSV.
 
@@ -289,7 +382,10 @@ def iter_records(
 
     Reads every CSV from ``discover_csv_files``, parses each of the up-to-ten
     example columns, and updates ``stats`` with per-stage counts (rows read,
-    cells skipped, orthography/translation coverage). Unreadable files are
+    cells skipped, orthography/translation coverage, groups minted). The
+    parseable examples of each row are partitioned into groups (see
+    ``_partition_row``) and tagged with a ``group_id`` of the form
+    ``<language>:<n>``, where ``n`` restarts per language. Unreadable files are
     logged and skipped.
 
     Args:
@@ -300,8 +396,9 @@ def iter_records(
     Yields:
         One record dict per parseable example: the four IGT fields plus
         ``igt-label``, ``knowledge point``, ``language``, ``source_file``,
-        ``chapter`` and ``section``.
+        ``chapter``, ``section`` and ``group_id``.
     """
+    lang_counters: dict[str, int] = defaultdict(int)
     for language, filepath in discover_csv_files(csv_root, only_language):
         stats['files'] += 1
         source_file = os.path.basename(filepath)
@@ -310,9 +407,11 @@ def iter_records(
                 reader = csv.DictReader(fh)
                 for row in reader:
                     stats['rows'] += 1
+                    raw_kp = row.get('Knowledge Point') or ''
                     kp = normalize_kp(row.get('Knowledge Point'))
                     chapter = clean_heading(row.get('Chapter'))
                     section = clean_heading(row.get('Section'))
+                    examples: list[tuple[str, dict[str, str]]] = []
                     for i in range(1, 11):
                         content = row.get(f'Content {i}')
                         if content is None:
@@ -328,6 +427,17 @@ def iter_records(
                             stats['skip_incomplete'] += 1
                             continue
                         label = (row.get(f'Label {i}') or '').strip()
+                        examples.append((label, parsed))
+                    if not examples:
+                        continue
+                    local_keys = _partition_row([label for label, _ in examples], raw_kp)
+                    group_ids: dict[int, str] = {}
+                    for key in local_keys:
+                        if key not in group_ids:
+                            group_ids[key] = f'{language}:{lang_counters[language]}'
+                            lang_counters[language] += 1
+                            stats['groups'] += 1
+                    for (label, parsed), key in zip(examples, local_keys, strict=True):
                         stats[
                             'with_orthography'
                             if parsed['igt-orthography']
@@ -343,6 +453,7 @@ def iter_records(
                             'source_file': source_file,
                             'chapter': chapter,
                             'section': section,
+                            'group_id': group_ids[key],
                         }
         except OSError as exc:
             logger.error('Failed to read %s: %s', filepath, exc)
@@ -377,6 +488,12 @@ def dedup_records(records: Iterator[dict[str, str]], stats: Counter) -> list[dic
         seen.add(key)
         out.append(rec)
     stats['post_dedup'] = len(out)
+    logger.info(
+        'Deduplication dropped %d of %d records (%d kept)',
+        stats['pre_dedup'] - len(out),
+        stats['pre_dedup'],
+        len(out),
+    )
     return out
 
 
@@ -417,6 +534,7 @@ def _report(stats: Counter) -> None:
         'with_orthography',
         'without_orthography',
         'with_translation',
+        'groups',
         'pre_dedup',
         'post_dedup',
     ):
@@ -450,6 +568,7 @@ def main(argv: list[str] | None = None) -> None:
     csv.field_size_limit(sys.maxsize if sys.maxsize < 2**31 else 2**31 - 1)
 
     stats: Counter = Counter()
+
     records = dedup_records(iter_records(args.csv_root, args.only_language, stats), stats)
     if args.limit is not None:
         records = records[: args.limit]
@@ -459,6 +578,7 @@ def main(argv: list[str] | None = None) -> None:
     ds = Dataset.from_list(records, features=FEATURES)
     logger.info('Dataset: %d rows, columns=%s', ds.num_rows, ds.column_names)
     save_dataset(ds, args.out_dir)
+    ds.push_to_hub('learning-machine-inc/ling-gym', private=True)
 
 
 if __name__ == '__main__':
