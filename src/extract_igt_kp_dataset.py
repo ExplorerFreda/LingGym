@@ -17,12 +17,13 @@ import argparse
 import csv
 import logging
 import os
+import random
 import re
 import sys
 from collections import Counter, defaultdict
 from typing import TYPE_CHECKING
 
-from datasets import Dataset, Features, Value
+from datasets import Dataset, DatasetDict, Features, Value
 
 
 if TYPE_CHECKING:
@@ -497,25 +498,86 @@ def dedup_records(records: Iterator[dict[str, str]], stats: Counter) -> list[dic
     return out
 
 
-def save_dataset(ds: Dataset, out_dir: str) -> None:
-    """Write ``ds`` to disk as an Arrow dataset plus Parquet and JSONL exports.
+def split_train_test(
+    records: list[dict], test_frac: float, seed: int, stats: Counter
+) -> tuple[list[dict], list[dict]]:
+    """Split records into train/test, reserving ``test_frac`` of each language.
+
+    The split is taken at the ``group_id`` level so a group's examples never
+    straddle the boundary. For each language its groups are shuffled with a
+    seeded RNG and whole groups are moved to the test set until that language's
+    held-out record count reaches ``round(test_frac * language_total)``. Because
+    only whole groups move, the realised test fraction may overshoot the target
+    by a few records. The split is deterministic for a given ``seed`` and set of
+    ``group_id`` values, and each split keeps the input's first-seen order.
 
     Args:
-        ds: The dataset to persist.
-        out_dir: Output directory for the Arrow dataset; the Parquet and JSONL
-            files are written alongside it as ``<out_dir>.parquet`` and
-            ``<out_dir>.jsonl``.
+        records: The deduplicated record dicts to split.
+        test_frac: Fraction of each language's records to reserve for test.
+        seed: Seed for the per-language group shuffle.
+        stats: Counter mutated in place with ``train`` and ``test`` totals.
+
+    Returns:
+        A ``(train, test)`` pair of record lists.
+    """
+    group_counts: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    for rec in records:
+        group_counts[rec['language']][rec['group_id']] += 1
+
+    rng = random.Random(seed)
+    test_ids: set[str] = set()
+    for language in sorted(group_counts):
+        counts = group_counts[language]
+        group_ids = sorted(counts)
+        rng.shuffle(group_ids)
+        target = round(test_frac * sum(counts.values()))
+        held = 0
+        for group_id in group_ids:
+            if held >= target:
+                break
+            test_ids.add(group_id)
+            held += counts[group_id]
+        logger.info(
+            '  %-16s train=%d test=%d (%.1f%%)',
+            language,
+            sum(counts.values()) - held,
+            held,
+            100 * held / sum(counts.values()),
+        )
+
+    train = [rec for rec in records if rec['group_id'] not in test_ids]
+    test = [rec for rec in records if rec['group_id'] in test_ids]
+    stats['train'] = len(train)
+    stats['test'] = len(test)
+    return train, test
+
+
+def save_dataset(ds: Dataset | DatasetDict, out_dir: str) -> None:
+    """Write ``ds`` to disk as an Arrow dataset plus Parquet and JSONL exports.
+
+    For a ``DatasetDict`` the Arrow store at ``out_dir`` holds one subdirectory
+    per split and the flat exports are written per split as
+    ``<out_dir>.<split>.parquet`` / ``<out_dir>.<split>.jsonl``; for a plain
+    ``Dataset`` they are ``<out_dir>.parquet`` / ``<out_dir>.jsonl``.
+
+    Args:
+        ds: The dataset (or split dict) to persist.
+        out_dir: Output directory for the Arrow store; the Parquet and JSONL
+            files are written alongside it.
     """
     out_dir = out_dir.rstrip('/')
     ds.save_to_disk(out_dir)
-    ds.to_parquet(out_dir + '.parquet')
-    ds.to_json(out_dir + '.jsonl', lines=True, force_ascii=False)
-    logger.info(
-        'Saved Arrow -> %s/ ; Parquet -> %s.parquet ; JSONL -> %s.jsonl',
-        out_dir,
-        out_dir,
-        out_dir,
-    )
+    splits = ds.items() if isinstance(ds, DatasetDict) else [(None, ds)]
+    for split, part in splits:
+        stem = out_dir if split is None else f'{out_dir}.{split}'
+        part.to_parquet(stem + '.parquet')
+        part.to_json(stem + '.jsonl', lines=True, force_ascii=False)
+        logger.info(
+            'Saved Arrow -> %s/ ; Parquet -> %s.parquet ; JSONL -> %s.jsonl',
+            out_dir if split is None else f'{out_dir}/{split}',
+            stem,
+            stem,
+        )
 
 
 def _report(stats: Counter) -> None:
@@ -561,6 +623,19 @@ def main(argv: list[str] | None = None) -> None:
         default=None,
         help='Cap on records (after dedup) for quick dry runs.',
     )
+    parser.add_argument(
+        '--test-frac',
+        type=float,
+        default=0.2,
+        help='Per-language fraction reserved for the test split, taken at the '
+        'group_id level; 0 produces a single unsplit dataset.',
+    )
+    parser.add_argument(
+        '--seed',
+        type=int,
+        default=0,
+        help='Seed for the train/test group shuffle.',
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format='%(levelname)s %(message)s')
@@ -568,17 +643,26 @@ def main(argv: list[str] | None = None) -> None:
     csv.field_size_limit(sys.maxsize if sys.maxsize < 2**31 else 2**31 - 1)
 
     stats: Counter = Counter()
-
     records = dedup_records(iter_records(args.csv_root, args.only_language, stats), stats)
     if args.limit is not None:
         records = records[: args.limit]
         stats['post_dedup'] = len(records)
 
     _report(stats)
-    ds = Dataset.from_list(records, features=FEATURES)
-    logger.info('Dataset: %d rows, columns=%s', ds.num_rows, ds.column_names)
+    if args.test_frac > 0:
+        logger.info('--- train/test split (seed=%d) ---', args.seed)
+        train, test = split_train_test(records, args.test_frac, args.seed, stats)
+        ds: Dataset | DatasetDict = DatasetDict(
+            {
+                'train': Dataset.from_list(train, features=FEATURES),
+                'test': Dataset.from_list(test, features=FEATURES),
+            }
+        )
+        logger.info('Dataset: train=%d, test=%d rows', len(train), len(test))
+    else:
+        ds = Dataset.from_list(records, features=FEATURES)
+        logger.info('Dataset: %d rows, columns=%s', ds.num_rows, ds.column_names)
     save_dataset(ds, args.out_dir)
-    ds.push_to_hub('learning-machine-inc/ling-gym', private=True)
 
 
 if __name__ == '__main__':
